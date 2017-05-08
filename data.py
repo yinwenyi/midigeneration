@@ -39,6 +39,20 @@ class note(object):
         return str([self.pos, self.dur, self.chn, self.pitch])
 
 class track(object):
+
+    def __init__(self, tr, meta, pos_offset=0):
+        self.time_top = 4
+        self.time_bottom = 4
+        for event in meta:
+            if event[0] == 'ticks': self.ticks = event[2]
+            elif event[0] == 'time': #TODO: time sig could change
+                self.time_top = event[2]
+                self.time_bottom = event[3]
+
+        self.bar = 4 * self.time_top / self.time_bottom
+        self.notes = self.get_notes(tr)
+        self.process()
+
     def pitches(self): # augment to show better info
         return [ n.pitch for n in self.notes ]
 
@@ -47,7 +61,7 @@ class track(object):
         return notes
 
     def get_durations(self):
-        # notes: a list of note's
+        # notes: a list of notes
         positions = sorted(list(set([n.pos for n in self.notes])))
         l = []
         if not positions: return l
@@ -153,19 +167,6 @@ class track(object):
         if not self.topline: return []
         return [ n.pitch % 12 for n in self.topline ]
 
-    def __init__(self, tr, meta, pos_offset=0):
-        self.time_top = 4
-        self.time_bottom = 4
-        for event in meta:
-            if event[0] == 'ticks': self.ticks = event[2]
-            elif event[0] == 'time': #TODO: time sig could change
-                self.time_top = event[2]
-                self.time_bottom = event[3]
-
-        self.bar = 4 * self.time_top / self.time_bottom
-        self.notes = self.get_notes(tr)
-        self.process()
-
     def process(self):
         self.topline = self.get_topline()
         self.botline = self.get_botline()
@@ -177,6 +178,14 @@ class track(object):
         return self
 
 class piece(object):
+    '''
+    Takes the nested list representation of midi files and breaks that down into the individual
+    tracks. Stores the meta track, other tracks, and a unified track.
+    Has a number of methods which implement operations that are performed on all tracks such as
+    transposition.
+    Can also compare to other pieces by using the unified tracks.
+    '''
+
     def __init__(self, filename_or_midi, filename=None, pos_offset=0):
         if isinstance(filename_or_midi, str):
             self.filename = filename_or_midi
@@ -216,6 +225,69 @@ class piece(object):
         for tr in self.midi[1:]:
             newtrack = track(tr, self.meta, self.pos_offset)
             self.tracks.append(newtrack)
+
+    def key(self):
+        '''
+        For now, assume that all pieces have key signature events.
+        :return: str corresponding to the key of the piece
+        '''
+        # TODO: what if no key event in meta? Need to infer key
+        # mapping num of accidentals to a key
+        # negative number means flats, pos means sharps
+        major_dict = { 0: 'C', 1: 'G', 2: 'D', 3: 'A', 4: 'E', 5: 'B', 6: 'F#', 7: 'C#',
+                       -1: 'F', -2: 'Bb', -3: 'Eb', -4: 'Ab', -5: 'Db', -6: 'Gb', -7: 'Cb'}
+        minor_dict = { 0: 'a', 1: 'e', 2: 'b', 3: 'f#', 4: 'c#', 5: 'g#', 6: 'd#', 7: 'a#',
+                       -1: 'd', -2: 'g', -3: 'c', -4: 'f', -5: 'bb', -6: 'eb', -7: 'ab'}
+        key = None
+        for event in self.meta:
+            if event[0] == 'key':
+                if event[3]:    # minor key
+                    key = minor_dict[event[2]]
+                else:           # major key
+                    key = major_dict[event[2]]
+        return key
+
+    def transpose_keys(self, new_key):
+        '''
+        Calculate the pitch change required to transpose from one key to another.
+        Calls the transpose method of this class with the appropriate offset.
+        :param new_key: str corresponding to the key we should transpose to
+        :return: Piece, transposed
+        '''
+        orig_key = self.key()
+        if orig_key == new_key:
+            return self
+
+        # map all minor keys and redundant major keys to major keys
+        key_dict = {'a': 'C', 'e': 'G', 'b': 'D', 'f#': 'A', 'c#': 'E', 'g#': 'B', 'd#': 'F#', 'a#': 'C#',
+                    'd': 'F', 'g': 'Bb', 'c': 'Eb', 'f': 'Ab', 'bb': 'Db', 'eb': 'Gb', 'ab': 'Cb',
+                    'Db': 'C#', 'Gb': 'F#', 'Cb': 'B'}
+        # keep a dict of the pitch deltas (a delta of 1 corresponds to moving up a half note on the keyboard)
+        # transposing from the first key to the second, ie ('C','G') means transposing from C major to G major
+        pitch_delta = {('C','G'): -5, ('C','D'): 2, ('C','A'): -3, ('C','E'): 4, ('C','B'): -1, ('C','F#'): 6, ('C','C#'): 1, ('C','F'): 5, ('C','Bb'): -2, ('C','Eb'): 3, ('C','Ab'): -4,
+                       ('G','D'): -5, ('G','A'): 2, ('G','E'): -3, ('G','B'): 4, ('G','F#'): -1, ('G','C#'): 6, ('G','F'): -2, ('G','Bb'): 3, ('G','Eb'): -4, ('G','Ab'): 1,
+                       ('D','A'): -5, ('D','E'): 2, ('D','B'): -3, ('D','F#'): 4, ('D','C#'): -1, ('D','F'): 3, ('D','Bb'): -4, ('D','Eb'): 1, ('D','Ab'): 6,
+                       ('A','E'): -5, ('A','B'): 2, ('A','F#'): -3, ('A','C#'): 4, ('A','F'): -4, ('A','Bb'): 1, ('A','Eb'): 6, ('A','Ab'): -1,
+                       ('E','B'): -5, ('E','F#'): 2, ('E','C#'): -3, ('E','F'): 1, ('E','Bb'): 6, ('E','Eb'): -1, ('E','Ab'): 4,
+                       ('B','F#'): -5, ('B','C#'): 2, ('B','F'): 6, ('B','Bb'): -1, ('B','Eb'): 4, ('B','Ab'): -3,
+                       ('F#','C#'): -5, ('F#','F'): -1, ('F#','Bb'): 4, ('F#','Eb'): -3, ('F#','Ab'): 2,
+                       ('C#','F'): 4, ('C#','Bb'): -3, ('C#','Eb'): 2, ('C#','Ab'): -5,
+                       ('F','Bb'): 5, ('F','Eb'): -2, ('F','Ab'): 3,
+                       ('Bb','Eb'): 5, ('Bb','Ab'): -2,
+                       ('Eb','Ab'): 5}
+
+        orig_key_major = orig_key
+        new_key_major = new_key
+        if orig_key in key_dict.keys():
+            orig_key_major = key_dict[orig_key]
+        if new_key in key_dict.keys():
+            new_key_major = key_dict[new_key]
+        if (orig_key_major,new_key_major) in pitch_delta.keys():
+            delta = pitch_delta[(orig_key_major,new_key_major)]
+        else:
+            delta = -1 * pitch_delta[(new_key_major,orig_key_major)]
+
+        return self.transpose(delta)
 
     def transpose(self, offset=0):
         newmidi = []

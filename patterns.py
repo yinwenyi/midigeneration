@@ -36,35 +36,39 @@ def preprocess_segments(Piece, c):
     d = {}
 
     with timer("Preprocess_segments: 1/2"):
+        # k is the size of the interval to use, in bars. We incrementally analyze the
+        # similarity of each interval to its downstream neighbour
         for k in range(1, Piece.num_bars + 1):
             print "Preprocess Segments: Part 1/2; Part {}/{}".format(k, Piece.num_bars)
 
             segs = {}
+            # split the piece into intervals of size k bars each
             for i in range(Piece.num_bars - k + 1):
                 segment = Piece.segment_by_bars(i, i+k)
                 segs[(i, i+k)] = segment
-
+            # examine each interval
             for i in range(Piece.num_bars - k + 1):
                 segment_i = segs[(i, i+k)]
-
+                # get the next interval's index
                 for j in range(Piece.num_bars - k + 1):
                     key = (i, j, k)
                     if i == j:
-                        d[key] = 1.0
+                        d[key] = 1.0 # it's the same interval, similarity is obviously 1
                         continue
                     same = d.get((j, i, k), [])
                     if same:
                         d[key] = same
                         continue
-
-                    # get rid of overlapping intervals
+                    # skip if the next interval overlaps with this one
                     if i <= j and j < i + k: continue
                     if j <= i and i < j + k: continue
-
+                    # if a smaller interval beginning at this bar had a score of less than 0.5, assume
+                    # that a larger interval beginning at this bar would not have a higher score
+                    # this is probably a runtime optimization tweak
                     if k > 4 and d[(i, j, k-1)] < 0.5:
                         d[key] = d[(i, j, k-1)]
                         continue
-
+                    # score the similarity of this segment to its downstream neighbour
                     segment_j = segs[(j, j+k)]
                     features = [segment_i.compare_with(segment_j)]
                     score = c.predict_proba(features)[0][1]
@@ -80,6 +84,7 @@ def preprocess_segments(Piece, c):
                     return True
             return False
 
+        # for each pair (starting bar, interval size), store its compared segments
         bin_by_i_k = {}
         for key in d.keys():
             i, j, k = key
@@ -88,28 +93,38 @@ def preprocess_segments(Piece, c):
             bin_by_i_k[(i, k)] = l
 
         # extract non-overlapping matches
+        # do this for each interval size
+        # TODO: for small interval sizes, we compare against segments that aren't even adjacent
+        # TODO: to our reference segment...which doesn't really make any sense?
         for k in range(1, Piece.num_bars + 1):
             for i in range(Piece.num_bars - k + 1):
                 keys_same_k = bin_by_i_k[(i, k)]
+                # get indexes of compared segs that had a similarity score higher than 0.5
                 result = [x[1] for x in keys_same_k if d[x] >= 0.5]
-                result.sort(key=lambda j: (-d[(i, j, k)], j))
+                result.sort(key=lambda j: (-d[(i, j, k)], j)) # sort in decr order of similarity
                 non_overlap = []
+                # this doesn't account for the case where the compared seg is itself
+                # will add itself to the list...
                 for j in result:
                     if not is_overlap(j, k, non_overlap): non_overlap.append(j)
 
                 match[(i, k)] = non_overlap
 
-    segs = {} #TODO
+    segs = {} #TODO: what is this?
     return segs, d, match
 
 def default_scoring_fn(key, Piece, d, match):
     i, k = key
+    # every element j is a segment that matched the reference segment (similarity > 0.5)
     freq_w = sum([ d[(i, j, k)] for j in match[key] ]) - 1 # a 'weighted' frequency
     k = k-1
     #sum_ = -freq_w**2 + (freq_w + k) * Piece.num_bars / 2 + -k**2 if match[key] else 0
     #return freq_w * k * k + k
     sum_ = -freq_w**2 + (freq_w + k) * Piece.num_bars / 2 + -k**2 if match[key] else 0
-    return (sum_ * k * k * freq_w + k) / Piece.num_bars
+    # TODO: this scoring function gives a score of ~1 to segments that are ~as long as the entire piece?
+    ans = (sum_ * k * k * freq_w + k) / Piece.num_bars if len(match[key])>1 else 0.0
+    return ans
+    #return (sum_ * k * k * freq_w + k) / Piece.num_bars
 
 def _default_scoring_fn(key, Piece, d, match):
     i, k = key
@@ -126,11 +141,15 @@ def segmentation(Piece, d, match, scoring_fn=default_scoring_fn, start=0, dur=-1
         dur = Piece.num_bars
 
     with timer("Segmentation: 1/3 done"):
+        # for segments of max size, this scoring function scores those pieces with a score of 1???
+        # this sorts the segments by the likelihood that the next segment is very similar to it
+        # note that score only contains segments where the likelihood is > 0.5
         score = {k: scoring_fn(k, Piece, d, match) for k in match.keys() if (k[0] >= start and k[0]+k[1] <= start+dur) }
-        best = sorted(score.keys(), key=lambda x: -score[x]) # order the keys by their score
+        best = sorted(score.keys(), key=lambda x: -score[x]) # order the keys by their score, descending order
 
     with timer("Segmentation: 2/3 done"):
         # Find set of non-overlapping intervals with maximum total score (weighted interval scheduling)
+        # bin_by_end keeps a dict of possible segments that end at the same bar
         bin_by_end = {}
         for key in score.keys():
             i, k = key
@@ -138,15 +157,20 @@ def segmentation(Piece, d, match, scoring_fn=default_scoring_fn, start=0, dur=-1
             l.append(key)
             bin_by_end[i+k] = l
 
+        # TODO: what the hell is M?
         M = [0]
         intervals = []
+        # each n is the index of the ending bar
         for n in range(1, dur + 1):
+            # key is the segment ending at n with the highest score + M[start_index]
             key = max([k for k in bin_by_end.get(n, [])], key=lambda x: score[x] + M[x[0]])
             intervals.append(key)
-            M.append(score[key] + M[key[0]])
+            M.append(score[key] + M[key[0]])  # update M with the score of this segment
 
         chosen = []
         n = 0
+        # start from the end of the piece, pick the segment that had the highest score
+        # aka the segment which
         while n < len(intervals):
             i, k = intervals[-n-1]
             chosen.append((i, k))
@@ -156,9 +180,11 @@ def segmentation(Piece, d, match, scoring_fn=default_scoring_fn, start=0, dur=-1
         bestscore = [(b, score[b]) for b in best]
         chosenscore = [(b, score[b]) for b in chosen]
 
+    # TODO: doesn't this just label sections? How to compare similar section across different pieces
+    # TODO: if they're all labeled arbitrarily?
     with timer("Segmentation: 3/3 done"):
         labelled_sections = {}
-        alphabet = 'ABCDEFGHIJKLMNOPQRSTOPWXYZ'
+        alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
         alpha_i = 0
         for c1 in chosen:
             i, k = c1

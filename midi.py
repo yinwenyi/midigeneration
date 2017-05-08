@@ -1,3 +1,4 @@
+from more_itertools import unique_everseen
 help={}
 help["song"]="List of tracks. Track 1 contains events that apply to all tracks, the other tracks contain individual events."
 help["track"]="List of events."
@@ -53,11 +54,13 @@ def delta(ticks):
 
 #Return the midi commands in trackchunk in a list.
 #trackchunk is assumed to have come from a track produced by chunkitize.
-#Return -1 in case of error
+#Return -1 in case the midi file contains unexpected data
 def getcommands(trackchunk):
     commands=[]
     global trackheaderlength
     i=trackheaderlength
+    # handle running status data by storing the last status byte seen so far
+    running_status = 0
     while i<len(trackchunk):
         commands+=[[]]
         result=getdelta(trackchunk[i:])
@@ -66,27 +69,69 @@ def getcommands(trackchunk):
         commands[-1]+=[result[0]]
         i+=result[1]
         if ord(trackchunk[i])&0xf0 in [0x80,0x90,0xa0,0xb0,0xe0]:
+            running_status = trackchunk[i]
             commands[-1]+=[trackchunk[i:i+3]]
             i+=3
         elif ord(trackchunk[i])&0xf0 in [0xc0,0xd0]:
+            running_status = trackchunk[i]
             commands[-1]+=[trackchunk[i:i+2]]
             i+=2
         elif ord(trackchunk[i])&0xf0==0xf0:
+            # system messages 0xf0 to 0xf7 clear the running status
+            if running_status and ord(trackchunk[i]) < 0xf8:
+                running_status = 0
+            # 0xff denotes a meta event:
+            # 0xff + <meta_type> [1 byte] + <v_length> [variable len] + <event_data_bytes> [v_length]
             if ord(trackchunk[i])==0xff:
-                commands[-1]+=[trackchunk[i:i+3+ord(trackchunk[i+2])]]
-                i+=3+ord(trackchunk[i+2])
+                result=getdelta(trackchunk[i+2:])
+                if result==-1:
+                    return -1
+                # i + 1 byte for <meta_type> + len of <v_length> + v_length + 1 because of slice defn
+                commands[-1]+=[trackchunk[i:i+2+result[1]+result[0]]]
+                i+=2+result[1]+result[0]
+            # all system-exclusive events begin with either F0 or F7, and end with F7
+            # 0xf0 + <length> + <bytes to be transmitted after F0>
+            # 0xf7 + <length> + <all bytes to be transmitted>
+            # <length> is a variable-length quantity, up to 4 bytes
+            elif ord(trackchunk[i]) in [0xf0, 0xf7]:
+                # result is a 2 entry array where result[0] is <length> and
+                # result[1] is the length of <length> in bytes (from 1 to 4)
+                result=getdelta(trackchunk[i+1:])
+                if result==-1:
+                    return -1
+                # do we even care about system-exclusive events?
+                commands[-1]+=[trackchunk[i:i+1+result[0]+result[1]]]
+                i+=1+result[0]+result[1]
+            # song position pointer message has two following data bytes
+            elif ord(trackchunk[i])==0xf2:
+                commands[-1]+=[trackchunk[i:i+3]]
+                i+=3
+            # song select message has one following data byte
+            elif ord(trackchunk[i])==0xf3:
+                commands[-1]+=[trackchunk[i:i+2]]
+                i+=2
+            # all other messages have no associated data bytes
             else:
                 commands[-1]+=[trackchunk[i]]
                 i+=1
+        # check if we are in running status mode. If so, use the last seen
+        # status byte for the received data bytes
+        elif running_status:
+            if ord(running_status)&0xf0 in [0x80, 0x90, 0xa0, 0xb0, 0xe0]:
+                commands[-1]+=[running_status+trackchunk[i:i+2]]
+                i+=2
+            elif ord(running_status)&0xf0 in [0xc0, 0xd0]:
+                commands[-1]+=[running_status+trackchunk[i:i+1]]
+                i+=1
+            else: # this is technically impossible
+                raise Exception("error")
+        # received a data byte when not in running status mode; exit
         else:
             raise Exception("error")
-            return -1
     if len(commands)<1:
         raise Exception("error")
-        return -1
     if ord(commands[-1][1][1])!=0x2f:
         raise Exception("error")
-        return -1
     return commands
 
 #return an unsigned integer from a big endian string of bytes
@@ -97,18 +142,22 @@ def uintb(bytes):
         result+=ord(byte)
     return result
 
-#return a list of lists of of midi file bytes, separated into the header and tracks
+#return a list of lists of of midi file bytes, separated into the header and track chunks
 #return -1 if the midi file doesn't look as expected
 def chunkitize(bytes):
+    # the header chunk is always 14 bytes long
     headerlength=14
     headertitle="MThd"
     if len(bytes)<headerlength:
         raise Exception("error")
         return -1
+    # the header chunk should always be first in the bytestring
     if bytes[0:len(headertitle)]!=headertitle:
         raise Exception("error")
         return -1
+    # add the header chunk to our list
     chunks=[bytes[0:headerlength]]
+    # keep track of where we are in the bytestring. Currently, we are just past the header chunk
     i=headerlength
     tracktitle="MTrk"
     global trackheaderlength
@@ -118,11 +167,15 @@ def chunkitize(bytes):
         if bytes[i:i+len(tracktitle)]!=tracktitle:
             raise Exception("error")
             return -1
+        # a track chunk = 'MTrk' + <length> + <track_event> [+ <track_event> ...]
+        # get <length>, a 4-byte value, which is the length of the track chunk
         tracklength=uintb(bytes[i+4:i+8])
         if len(bytes)<i+trackheaderlength+tracklength:
             raise Exception("error")
             return -1
+        # add the entire track chunk to our list
         chunks+=[bytes[i:i+trackheaderlength+tracklength]]
+        # move our tracking pointer down the bytestring, continue reading until there are no more track chunks
         i+=trackheaderlength+tracklength
     if i!=len(bytes):
         raise Exception("error")
@@ -137,18 +190,28 @@ def chunkitize(bytes):
 def sharpstosemitones(sharps, minor):
     return (sharps*7-minor*3)%12
 
+# Uniquify a list of notes and preserve the order
+def uniquify_notes(seq):
+   seen = {}
+   result = []
+   for item in seq:
+       tup = tuple(item) #lists are not hashable
+       if tup in seen: continue
+       seen[tup] = 1
+       result.append(item)
+   return result
+
 #Parse a midi bytes and return a song
 #Return -1 in case of error
 def parse(bytes):
     chunks=chunkitize(bytes)
     if chunks==-1:
         raise Exception("error")
-        return -1
     ticksperquarter=uintb(chunks[0][12:14])
     if ticksperquarter==0:
         raise Exception("error")
-        return -1
-    if uintb(chunks[0][8:10])==1:
+    # support single and multi-track format
+    if uintb(chunks[0][8:10]) in [0,1]:
         song=[]
         if len(chunks)<2:
             return song
@@ -169,32 +232,42 @@ def parse(bytes):
                             sharps=(sharps&0x7f)-0x80
                         track+=[["key", ticks, sharps, ord(command[1][4])]]
         song+=[track]
-        for i in range(2,len(chunks)):
+        # assume the format is multi-track
+        val_start = 2
+        val_stop = len(chunks)
+        # in case of single track, readjust for-loop values
+        if uintb(chunks[0][8:10])==0:
+            val_start = 1
+        # extract notes
+        for i in range(val_start,val_stop):
             ticks=0
-            commands=getcommands(chunks[i])
+            if i > 1: # don't re-fetch single track commands
+                commands=getcommands(chunks[i])
             track=[]
-            for i in range(len(commands)):
-                command=commands[i]
+            for j in range(len(commands)):
+                command=commands[j]
                 ticks+=command[0]
                 if ord(command[1][0])&0xf0==0x90 and ord(command[1][2])!=0:#Note on
                     duration=0
-                    for offcommand in commands[i+1:]:
+                    for offcommand in commands[j+1:]:
                         duration+=offcommand[0]
                         if ord(offcommand[1][0])&0xf0==0x90 and ord(offcommand[1][2])==0 or ord(offcommand[1][0])&0xf0==0x80:#Note off
                             if offcommand[1][1]==command[1][1]:
                                 break
                     track+=[["note", ticks, duration, ord(command[1][0])&0x0f, ord(command[1][1])]]
+            # uniquify track list
+            track=uniquify_notes(track)
             song+=[track]
         return song
+    # no support for multi-song format
     raise Exception("error")
-    return -1
 
 #Read a midi file and return a nicely constructed list that represents the song in the midi.
 #Return -1 in case of error
 #The list is structured as follows:
 #It is a list of tracks.
 #The first track specifies things that correspond to all tracks.
-#The other tracks specify things specific to themselves.
+#The other tracks (if they exist) specify things specific to themselves.
 #Each track is a list of events.
 #An event has the form [description, position, values...]
 #description is a string describing the type of event.
@@ -204,8 +277,8 @@ def parse(bytes):
 #"ticks": Value is number of ticks per quarter note.
 #"tempo": Value is number of microseconds per quarter note.
 #"time": Values are top of time signature, bottom of time signature.
-#"key": Values are number of sharps (negative means flats), major (0) or minor (1)
-#"note": Values are duration, channel, note number
+#"key": Values are ticks, number of sharps (negative means flats), major (0) or minor (1)
+#"note": Values are ticks, duration, channel, note number
 def read(filename):
     file=open(filename,"rb")#Open in binary read mode.
     bytes=file.read()
@@ -242,7 +315,7 @@ def ilog2(x):
         result+=1
     return result
 
-#Write a midi file based on a nicely contructed list.
+#Write a midi file based on a nicely constructed list.
 def write(filename, song):
     file=open(filename,"wb")
     ticks=0
@@ -317,7 +390,7 @@ def bar(song):
     for event in song[0]:
         if event[0]=="ticks":
             ticks=event[2]
-        elif event[0]=="time":#make this better -- time sig could change
+        elif event[0]=="time": #TODO: make this better -- time sig could change
             top=event[2]
             bottom=event[3]
     bar=4*ticks*top/bottom

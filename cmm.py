@@ -1,8 +1,10 @@
 # Markov Model thingy
-import random, sys
+import random, sys, glob
 import data, midi, experiments, patterns, chords
 from decimal import Decimal as fixed
+from decimal import ROUND_HALF_DOWN
 from IPython import embed
+import pickle
 import copy
 
 class Markov(object):
@@ -41,23 +43,25 @@ class Markov(object):
         v.append(Markov.STOP_TOKEN)
         self.markov[tuple(buf)] = v
 
-    def generate(self, seed=[]):
+    def generate(self, seed=[], max_len=float("inf")):
         '''
         generate a statechain from a (already trained) model
         seed is optional; if provided, will build statechain from seed
+        len is optional; if provided, will only build statechain up to given len
 
         note: seed is untested and may very well not work...
         however, seed is core functionality that will help combine all_keys and segmentation (in the future)
-
+        transitions from segments to segments are accomplished by using seed to look for a next valid segment
+        that starts with the same seed as the previous segment ends with?
         '''
         buf = self.get_start_buffer(seed)
         state_chain = []
         count = 0
 
         # we might generate an empty statechain, count will stop us from infinite loop
-        while not state_chain or count < 10:
+        while not state_chain and count < 50:
             elem = self.generate_next_state(buf)
-            while elem != Markov.STOP_TOKEN:
+            while elem != Markov.STOP_TOKEN and len(state_chain) < max_len:
                 state_chain.append(elem)
                 buf = self.shift_buffer(buf, elem)
                 elem = self.generate_next_state(buf) # generate another
@@ -173,8 +177,8 @@ class NoteState(State):
     (docs: todo)
     - state_position:
     - state_duration:
-    - chord:
-    - origin:
+    - chord: the chord that these notes most likely belong to
+    - origin: midi filename
 
     '''
 
@@ -193,8 +197,10 @@ class NoteState(State):
 
     def state_data(self):
         ''' make hashable version of state information intended to be hashed '''
-        notes_info = [ (n.pitch, n.dur) for n in self.notes ]
-        relevant = [self.bar_pos, self.state_duration, self.chord, tuple(notes_info)]
+        notes_info = [n.pitch for n in self.notes]
+        quantized_pos = self.bar_pos.quantize(fixed('0.01'), rounding=ROUND_HALF_DOWN)
+        quantized_dur = self.state_duration.quantize(fixed('0.0001'), rounding=ROUND_HALF_DOWN)
+        relevant = [quantized_pos, quantized_dur, self.chord, frozenset(notes_info)]
         return tuple(relevant)
 
     def copy(self):
@@ -284,9 +290,12 @@ class NoteState(State):
     def piece_to_state_chain(piece, use_chords=True):
         '''
         Convert a data.piece into a state chain (list of NoteStates)
-        arg use_chord: if True, NoteState holds chord label as state information
+        arg use_chords: if True, NoteState holds chord label as state information
 
         '''
+        # TODO: shouldn't have to hardcode this
+        use_chords = True
+        key_sig = ""
 
         # group notes into bins by their starting positions
         bin_by_pos = {}
@@ -298,7 +307,7 @@ class NoteState(State):
         positions = sorted(bin_by_pos.keys())
         if use_chords:
             cc = chords.fetch_classifier()
-            allbars = cc.predict(piece) # assign chord label for each bar
+            key_sig, allbars = cc.predict(piece) # assign chord label for each bar
             state_chain = map(lambda x: NoteState(bin_by_pos[x], piece.bar, chord=allbars[x/piece.bar], origin=piece.filename), positions)
         else:
             state_chain = map(lambda x: NoteState(bin_by_pos[x], piece.bar, chord='', origin=piece.filename), positions)
@@ -311,11 +320,79 @@ class NoteState(State):
             state_chain[i].state_duration = state_chain[i+1].state_position - state_chain[i].state_position
         state_chain[-1].state_duration = max(n.dur for n in state_chain[-1].notes) # the last state needs special care
 
-        return state_chain
+        return key_sig, state_chain
 
     def __repr__(self):
         tup = self.state_data()
         return str(tup) + ' ' + str(self.notes)
+
+def get_key_offset(key1, key2):
+    '''
+    Returns the relative pitch offset between two keys.
+    :param key1: The original key
+    :param key2: The new, desired key
+    :return: int
+    '''
+    key1 = str(key1)
+    key2 = str(key2)
+
+    # map all minor keys to major keys, and also all redundant major keys to major keys
+    key_dict = {'Am': 'C',          # begin minor keys
+                'Em': 'G',
+                'Bm': 'D',
+                'F#/Gbm': 'A',
+                'C#/Dbm': 'E',
+                'G#/Abm': 'B',
+                'D#/Ebm': 'F#',
+                'A#/Bbm': 'C#',
+                'Dm': 'F',
+                'Gm': 'Bb',
+                'Cm': 'Eb',
+                'Fm': 'Ab',         # end minor keys
+                'C#/Db': 'C#',      # begin redundant major keys
+                'F#/Gb': 'F#',
+                'G#/Ab': 'Ab',
+                'D#/Eb': 'Eb',
+                'A#/Bb': 'Bb'}      # end redundant major keys
+
+    # keep a dict of the pitch deltas (a delta of 1 corresponds to moving up a half note on the keyboard)
+    # transposing from the first key to the second, ie ('C','G') means transposing from C major to G major
+    pitch_delta = {('C', 'G'): -5, ('C', 'D'): 2, ('C', 'A'): -3, ('C', 'E'): 4, ('C', 'B'): -1, ('C', 'F#'): 6,
+                   ('C', 'C#'): 1, ('C', 'F'): 5, ('C', 'Bb'): -2, ('C', 'Eb'): 3, ('C', 'Ab'): -4,
+                   ('G', 'D'): -5, ('G', 'A'): 2, ('G', 'E'): -3, ('G', 'B'): 4, ('G', 'F#'): -1, ('G', 'C#'): 6,
+                   ('G', 'F'): -2, ('G', 'Bb'): 3, ('G', 'Eb'): -4, ('G', 'Ab'): 1,
+                   ('D', 'A'): -5, ('D', 'E'): 2, ('D', 'B'): -3, ('D', 'F#'): 4, ('D', 'C#'): -1, ('D', 'F'): 3,
+                   ('D', 'Bb'): -4, ('D', 'Eb'): 1, ('D', 'Ab'): 6,
+                   ('A', 'E'): -5, ('A', 'B'): 2, ('A', 'F#'): -3, ('A', 'C#'): 4, ('A', 'F'): -4, ('A', 'Bb'): 1,
+                   ('A', 'Eb'): 6, ('A', 'Ab'): -1,
+                   ('E', 'B'): -5, ('E', 'F#'): 2, ('E', 'C#'): -3, ('E', 'F'): 1, ('E', 'Bb'): 6, ('E', 'Eb'): -1,
+                   ('E', 'Ab'): 4,
+                   ('B', 'F#'): -5, ('B', 'C#'): 2, ('B', 'F'): 6, ('B', 'Bb'): -1, ('B', 'Eb'): 4, ('B', 'Ab'): -3,
+                   ('F#', 'C#'): -5, ('F#', 'F'): -1, ('F#', 'Bb'): 4, ('F#', 'Eb'): -3, ('F#', 'Ab'): 2,
+                   ('C#', 'F'): 4, ('C#', 'Bb'): -3, ('C#', 'Eb'): 2, ('C#', 'Ab'): -5,
+                   ('F', 'Bb'): 5, ('F', 'Eb'): -2, ('F', 'Ab'): 3,
+                   ('Bb', 'Eb'): 5, ('Bb', 'Ab'): -2,
+                   ('Eb', 'Ab'): 5}
+
+    # remap the keys if needed
+    if key1 in key_dict.keys():
+        orig_key_major = key_dict[key1]
+    else:
+        orig_key_major = key1
+    if key2 in key_dict.keys():
+        new_key_major = key_dict[key2]
+    else:
+        new_key_major = key2
+
+    if orig_key_major == new_key_major:
+        return 0
+
+    if (orig_key_major, new_key_major) in pitch_delta.keys():
+        delta = pitch_delta[(orig_key_major, new_key_major)]
+    else:   # reverse order is still the same offset, just in the opposite direction
+        delta = -1 * pitch_delta[(new_key_major, orig_key_major)]
+
+    return delta
 
 def piece_to_markov_model(musicpiece, classifier=None, segmentation=False, all_keys=False):
     '''
@@ -330,8 +407,11 @@ def piece_to_markov_model(musicpiece, classifier=None, segmentation=False, all_k
     mm = Markov()
     print "all_keys:" + str(all_keys)
     if not segmentation:
-        state_chain = NoteState.piece_to_state_chain(musicpiece, all_keys)
-        mm.add(state_chain)
+        key_sig, state_chain = NoteState.piece_to_state_chain(musicpiece, True) # always use chords
+        offset = get_key_offset(key_sig[0], 'C')   # transpose everything to C major
+        shifted_state_chain = [s.transpose(offset) for s in state_chain]
+        mm.add(shifted_state_chain)
+
         if all_keys: # shift piece up some number of tones, and down some number of tones
             for i in range(1, 6):
                 shifted_state_chain = [ s.transpose(i) for s in state_chain ]
@@ -385,6 +465,10 @@ def generate_song(mm, meta, bar, segmentation=False):
     '''
     Generate music, i.e. a list of MIDI tracks, from the given Markov mm
     you would also need to provide a list of meta events (which you can pull from any MIDI file)
+
+    mm: the Markov model
+    meta: list of meta events, is an attribute of class piece
+    bar: ticks per bar
     '''
 
     song = []
@@ -420,27 +504,35 @@ def generate_output():
         song, gen, a = generate_song(mm, musicpiece.meta, musicpiece.bar, segmentation)
 
     else:
-        pieces = ["mid/hilarity.mid", "mid/froglegs.mid", "mid/easywinners.mid"]
-        #pieces = ["mid/britney3.mid"]
+        dir = "./mid/Bach/*"
+        pieces = glob.glob(dir)
+        #pieces = ["mid/Bach/bwv804.mid", "mid/Bach/bwv802.mid"]
+
         mm = Markov()
 
         # generate a model _mm for each piece then add them together
+        p = pieces.pop(0)
+        musicpiece = data.piece(p)
+        _mm = piece_to_markov_model(musicpiece, c, segmentation, all_keys) # no transpose
+        mm = mm.add_model(_mm)
+
         for p in pieces:
             musicpiece = data.piece(p)
             _mm = piece_to_markov_model(musicpiece, c, segmentation, all_keys)
             mm = mm.add_model(_mm)
+
         song, gen, a = generate_song(mm, musicpiece.meta, musicpiece.bar, segmentation)
 
     midi.write('output.mid', song)
     return
 
-def generate_score():
-    '''() -> NoneType
+def generate_score(file):
+    '''(str) -> NoneType
     Generate the score (.xml) for the auto-generated midi file.
     Please open using a MusicXMl reader such as Finale NotePad.
     '''
     import music21   # required to display score
-    midi_file_output = music21.converter.parse("output.mid")
+    midi_file_output = music21.converter.parse(file)
     midi_file_output.show()
     return
 

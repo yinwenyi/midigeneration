@@ -155,11 +155,12 @@ class chord_classifier(object):
         self.classifier = analyze.train_classifier(self.generate_train_set(), self.classifier)
 
     def predict(self, piece):
-        nf = note_frequency()
+        nf = note_frequency() # nf is a bin, where the key is the pitch (mod 12) and the value is the sum of the durations of all notes that have that pitch
         for n in piece.unified_track.notes:
             nf.add(n)
         ta = np.array(nf.normalize().to_list())
-        print 'Key Signature :', self.classifier.predict(ta)
+        key_sig = self.classifier.predict(ta)
+        print 'Key Signature :', key_sig
 
         allbars = []
         for i in range(piece.num_bars):
@@ -170,7 +171,7 @@ class chord_classifier(object):
             ta = np.array(nf.normalize().to_list())
             predicted = self.classifier.predict(ta)
             allbars.append(predicted[0])
-        return allbars
+        return key_sig, allbars
 
 def freq_integral(object):
 
